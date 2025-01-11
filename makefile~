@@ -1,0 +1,10 @@
+.POSIX:
+.PHONY: all clean
+
+TARGET = write_gpt
+CFLAGS = -std=c17 -Wall -Wextra -Wpedantic -02
+
+all: $(TARGET)
+
+clean:
+    rm -f $(TARGET)
