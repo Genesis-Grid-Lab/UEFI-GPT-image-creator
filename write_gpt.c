@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <uchar.h>
 
 //++++++++++++++++++++++++++++++++++++++++++++++++++++
 //Global Typedefs ++++++++++++++++++++++++++++++++++++
@@ -57,6 +58,34 @@ typedef struct {
   uint8_t reserved_2[512-92];
 }__attribute__((packed)) Gpt_Header;
 
+// GPT Partition Entry
+typedef struct{
+  GUID partition_type_guid;
+  GUID unique_guid;
+  uint64_t starting_lba;
+  uint64_t ending_lba;
+  uint64_t attributes;
+  char16_t name[36];              // UCS-2 (UTF-16 limited to code points 0x0000 - 0xFFFF)
+}__attribute__((packed)) Gpt_Partition_Entry;
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++
+// Global constants, enums +++++++++++++++++++++++++
+//++++++++++++++++++++++++++++++++++++++++++++++++++
+// EFI System Partition GUID
+const GUID EFI_GUID = { 0xC12A7328, 0xF81F, 0x11D2, 0xBA, 0x4B,
+						{0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B} };
+
+// (Microsoft) Basic Data GUID
+const GUID BASIC_DATA_GUID = { 0xEBD0A0A2, 0xB9E5, 0x4433, 0x87, 0xC0,
+							   { 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7} };
+
+enum {
+    GPT_TABLE_ENTRY_SIZE = 128,
+	NUMBER_OF_GPT_TABLE_ENTRIES = 128,
+	GPT_TABLE_SIZE = 16384,               // Minimum size per UEFI spec 2.10
+	ALIGNMENT = 1048576,                  // 1MiB alignment value
+};
+
 //++++++++++++++++++++++++++++++++++++++++++++++++++
 //Global Variables +++++++++++++++++++++++++++++++++
 //++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -65,7 +94,8 @@ uint64_t lba_size = 512;
 uint64_t esp_size = 1024*1024*33;   // 33 MiB
 uint64_t data_size = 1024*1024*1;   // 1 MiB
 uint64_t image_size = 0;
-uint64_t esp_lbas, data_lbas, image_size_lbas;
+uint64_t esp_size_lbas = 0, data_size_lbas = 0, image_size_lbas = 0; // size in LBAs
+uint64_t align_lba = 0, esp_lba = 0, data_lba = 0;         // Starting LBA values
 
 //=================================================
 //Global Funtions =================================
@@ -79,6 +109,13 @@ void write_full_lba_size(FILE *image){
   for (uint8_t i = 0; i < (lba_size - sizeof zero_sector) / sizeof zero_sector; i++){
 	fwrite(zero_sector, sizeof zero_sector, 1, image);
   }
+}
+
+//-------------------------------------------------
+// Get next highest  aligned lba value after input lba
+//-------------------------------------------------
+uint64_t next_aligned_lba(const uint64_t lba){
+	return lba - (lba % align_lba) + align_lba;
 }
 
 //-------------------------------------------------
@@ -123,7 +160,7 @@ GUID new_guid(void){
 uint32_t crc_table[256];
 
 void create_crc32_table(void){
-  uint32_t c;
+  uint32_t c = 0;
   int32_t n, k;
 
   for (n = 0; n < 256; n++){
@@ -146,12 +183,13 @@ uint32_t calculate_crc32(void* buff, int32_t len){
 
   uint8_t *bufp = buff;
   uint32_t c = 0xFFFFFFFFL;
-  int32_t n;
 
-  if(!made_crc_table)
+  if(!made_crc_table){
 	create_crc32_table();
+	made_crc_table = true;
+  }
 
-  for(n = 0; n < len; n++)
+  for(int32_t n = 0; n < len; n++)
 	c = crc_table[(c ^ bufp[n]) & 0xFF] ^ (c >> 8);
 
   // Invert bits for return value
@@ -196,7 +234,7 @@ bool write_mbr(FILE *image){
 // Whrite GPT headers & tables, primary & secondary
 //-------------------------------------------------
 bool write_gpt(FILE *image){
-  //TOBO:
+  // Fill out primary GPT header
   Gpt_Header primary_gpt = {
 	.signature = { "EFI PART" },
 	.revision = 0x00010000, //Version 1.0
@@ -215,7 +253,67 @@ bool write_gpt(FILE *image){
 
 	.reserved_2 = { 0 },
   };
+
+  // Fill out primary table partition entires
+  Gpt_Partition_Entry gpt_table[NUMBER_OF_GPT_TABLE_ENTRIES] = {
+	  // EFI System Partition
+	  {
+		  .partition_type_guid = EFI_GUID,
+		  .unique_guid = new_guid(),
+		  .starting_lba = esp_lba,
+		  .ending_lba = esp_lba + esp_size_lbas,
+		  .attributes = 0,
+		  .name = u"EFI SYSTEM",
+	  },
+
+	  // Basic Data Partition
+	  {
+		  .partition_type_guid = BASIC_DATA_GUID,
+		  .unique_guid = new_guid(),
+		  .starting_lba = data_lba,
+		  .ending_lba = data_lba + data_size_lbas,
+		  .attributes = 0,
+		  .name = u"BASIC DATA",
+	  },
+  };
+
+  // Fill out primary header CRC value
+  primary_gpt.partition_table_crc32 = calculate_crc32(gpt_table, sizeof gpt_table);
+  primary_gpt.header_crc32 = calculate_crc32(&primary_gpt, primary_gpt.header_size);
+
+  // Write primary gpt header to file
+  if(fwrite(&primary_gpt, 1 , sizeof primary_gpt, image) != sizeof primary_gpt)
+	  return false;
+  write_full_lba_size(image);
+
+  // Write primary gpt table to file
+  if(fwrite(&gpt_table, 1 , sizeof gpt_table, image) != sizeof gpt_table)
+	  return false;
+
+  // Fill out secondary GPT header
+  Gpt_Header secondary_gpt = primary_gpt;
   
+  secondary_gpt.header_crc32 = 0;
+  secondary_gpt.partition_table_crc32 = 0;
+  secondary_gpt.my_lba = primary_gpt.alternate_lba;
+  secondary_gpt.alternate_lba = primary_gpt.my_lba;
+  secondary_gpt.partition_table_lba = image_size_lbas - 1 - 32;
+
+  // Fill out secondary header CRC values
+  secondary_gpt.partition_table_crc32 = calculate_crc32(gpt_table, sizeof gpt_table);
+  secondary_gpt.header_crc32 = calculate_crc32(&secondary_gpt, secondary_gpt.header_size);
+
+  // Go to position of secondary table
+  fseek(image, secondary_gpt.partition_table_lba * lba_size, SEEK_SET);
+
+  // Write secondary gpt table to file
+  if(fwrite(&gpt_table, 1 , sizeof gpt_table, image) != sizeof gpt_table)
+	  return false;  
+
+  // Write secondary gpt header to file
+  if(fwrite(&secondary_gpt, 1 , sizeof secondary_gpt, image) != sizeof secondary_gpt)
+	  return false;
+  write_full_lba_size(image);
 	
   return true;
 }
@@ -231,10 +329,17 @@ int main(void){
 	return EXIT_FAILURE;
   }
 
-  //Set sizes
-  image_size = esp_size + data_size + (1024*1024); // Add some extra padding for GPTs/MBR
+  //Set sizes & LBA values
+  const uint64_t padding = (ALIGNMENT * 2 + (lba_size * 67));
+  image_size = esp_size + data_size + padding; // Add some extra padding for GPTs/MBR
 
   image_size_lbas = bytes_to_lbas(image_size);
+
+  align_lba = ALIGNMENT / lba_size;
+  esp_lba = align_lba;
+  esp_size_lbas = bytes_to_lbas(esp_size);
+  data_size_lbas = bytes_to_lbas(data_size);
+  data_lba = next_aligned_lba(esp_lba + esp_size_lbas);
 
   // Seed random number generation
   srand(time(NULL));

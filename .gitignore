@@ -60,3 +60,6 @@ auto-save-list
 tramp
 .\#*
 .vscode/
+.img
+
+write_gpt
